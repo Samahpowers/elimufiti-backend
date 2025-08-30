@@ -5,16 +5,25 @@ const { authenticateToken, requireRole } = require('../middleware/auth');
 
 const router = express.Router();
 
-// Get all resources with filtering
+// ============================================
+// GET ALL RESOURCES WITH FILTERING & PAGINATION
+// ============================================
 router.get('/', [
   query('page').optional().isInt({ min: 1 }),
   query('limit').optional().isInt({ min: 1, max: 100 }),
-  query('grade').optional().isIn(['preprimary', 'grade1', 'grade2', 'grade3', 'grade4', 'grade5', 'grade6', 'grade7', 'grade8', 'grade9', 'grade10', 'grade11', 'grade12']),
+  query('grade').optional().isIn([
+    'preprimary', 'grade1', 'grade2', 'grade3', 'grade4', 'grade5',
+    'grade6', 'grade7', 'grade8', 'grade9', 'grade10', 'grade11', 'grade12'
+  ]),
   query('subject').optional().isLength({ min: 1 }),
   query('year').optional().isInt({ min: 2020, max: 2030 }),
   query('term').optional().isIn(['1', '2', '3']),
-  query('resource_type').optional().isIn(['lesson_plan', 'worksheet', 'assessment', 'marking_scheme', 'question_paper', 'teaching_aid', 'mocks', 'schemes', 'curriculum_design', 'notes', 'holiday_assignment']),
-  query('search').optional().isLength({ min: 1 })
+  query('resource_type').optional().isIn([
+    'lesson_plan', 'worksheet', 'assessment', 'marking_scheme', 'question_paper',
+    'teaching_aid', 'mocks', 'schemes', 'curriculum_design', 'notes', 'holiday_assignment'
+  ]),
+  query('search').optional().isLength({ min: 1 }),
+  query('school').optional().isLength({ min: 1 })
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -35,63 +44,71 @@ router.get('/', [
       term,
       resource_type,
       search,
-      is_premium
+      is_premium,
+      school
     } = req.query;
 
     const offset = (page - 1) * limit;
-    let whereConditions = [];
-    let queryParams = [];
-    let paramCount = 0;
+    let whereConditions = ['r.status = $1'];
+    let queryParams = ['active'];
+    let paramCount = 1;
 
-    // Build WHERE conditions
+    // Build dynamic WHERE clauses
     if (grade) {
       paramCount++;
-      whereConditions.push(`grade = $${paramCount}`);
+      whereConditions.push(`r.grade = $${paramCount}`);
       queryParams.push(grade);
     }
 
     if (subject) {
       paramCount++;
-      whereConditions.push(`subject = $${paramCount}`);
+      whereConditions.push(`r.subject = $${paramCount}`);
       queryParams.push(subject);
     }
 
     if (year) {
       paramCount++;
-      whereConditions.push(`year = $${paramCount}`);
+      whereConditions.push(`r.year = $${paramCount}`);
       queryParams.push(year);
     }
 
     if (term) {
       paramCount++;
-      whereConditions.push(`term = $${paramCount}`);
+      whereConditions.push(`r.term = $${paramCount}`);
       queryParams.push(term);
     }
 
     if (resource_type) {
       paramCount++;
-      whereConditions.push(`resource_type = $${paramCount}`);
+      whereConditions.push(`r.resource_type = $${paramCount}`);
       queryParams.push(resource_type);
     }
 
     if (is_premium !== undefined) {
       paramCount++;
-      whereConditions.push(`is_premium = $${paramCount}`);
+      whereConditions.push(`r.is_premium = $${paramCount}`);
       queryParams.push(is_premium === 'true');
     }
 
     if (search) {
       paramCount++;
-      whereConditions.push(`(title ILIKE $${paramCount} OR description ILIKE $${paramCount})`);
+      whereConditions.push(`(r.title ILIKE $${paramCount} OR r.description ILIKE $${paramCount})`);
       queryParams.push(`%${search}%`);
     }
 
-    const whereClause = whereConditions.length > 0 ? `WHERE ${whereConditions.join(' AND ')}` : '';
+    if (school) {
+      paramCount++;
+      whereConditions.push(`r.school ILIKE $${paramCount}`);
+      queryParams.push(`%${school}%`);
+    }
 
-    // Get resources with files
+    const whereClause = `WHERE ${whereConditions.join(' AND ')}`;
+
+    // Fetch resources with files in one query
     const resourcesQuery = `
       SELECT 
         r.*,
+        u.full_name as uploaded_by_name,
         COALESCE(
           json_agg(
             json_build_object(
@@ -99,19 +116,21 @@ router.get('/', [
               'name', rf.file_name,
               'url', rf.file_url,
               'size', rf.file_size,
-              'type', rf.file_type
-            )
-          ) FILTER (WHERE rf.id IS NOT NULL), 
-          '[]'
+              'type', rf.file_type,
+              'mime_type', rf.mime_type,
+              'r2_key', rf.r2_key
+            ) ORDER BY rf.file_order, rf.created_at
+          ) FILTER (WHERE rf.id IS NOT NULL AND rf.is_active = true), 
+          '[]'::json
         ) as files
       FROM resources r
-      LEFT JOIN resource_files rf ON r.id = rf.resource_id
+      LEFT JOIN resource_files rf ON r.id = rf.resource_id AND rf.is_active = true
+      LEFT JOIN users u ON r.uploaded_by = u.id
       ${whereClause}
-      GROUP BY r.id
+      GROUP BY r.id, u.full_name
       ORDER BY r.created_at DESC
       LIMIT $${paramCount + 1} OFFSET $${paramCount + 2}
     `;
-
     queryParams.push(limit, offset);
 
     const result = await db.query(resourcesQuery, queryParams);
@@ -133,6 +152,7 @@ router.get('/', [
         }
       }
     });
+
   } catch (error) {
     console.error('Get resources error:', error);
     res.status(500).json({
@@ -142,7 +162,9 @@ router.get('/', [
   }
 });
 
-// Get single resource
+// ============================================
+// GET SINGLE RESOURCE BY ID
+// ============================================
 router.get('/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -158,15 +180,17 @@ router.get('/:id', async (req, res) => {
               'name', rf.file_name,
               'url', rf.file_url,
               'size', rf.file_size,
-              'type', rf.file_type
-            )
-          ) FILTER (WHERE rf.id IS NOT NULL), 
-          '[]'
+              'type', rf.file_type,
+              'mime_type', rf.mime_type,
+              'r2_key', rf.r2_key
+            ) ORDER BY rf.file_order
+          ) FILTER (WHERE rf.id IS NOT NULL AND rf.is_active = true), 
+          '[]'::json
         ) as files
       FROM resources r
-      LEFT JOIN resource_files rf ON r.id = rf.resource_id
+      LEFT JOIN resource_files rf ON r.id = rf.resource_id AND rf.is_active = true
       LEFT JOIN users u ON r.uploaded_by = u.id
-      WHERE r.id = $1
+      WHERE r.id = $1 AND r.status = 'active'
       GROUP BY r.id, u.full_name
     `, [id]);
 
@@ -181,6 +205,7 @@ router.get('/:id', async (req, res) => {
       success: true,
       data: result.rows[0]
     });
+
   } catch (error) {
     console.error('Get resource error:', error);
     res.status(500).json({
@@ -190,15 +215,24 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// Create new resource (staff/admin only)
+// ============================================
+// CREATE NEW RESOURCE (FILLS 2 TABLES)
+// ============================================
 router.post('/', authenticateToken, requireRole(['staff', 'admin']), [
-  body('title').trim().isLength({ min: 5, max: 200 }),
+  body('school').trim().isLength({ min: 1 }).withMessage('School is required'),
+  body('title').trim().isLength({ min: 5, max: 500 }),
   body('description').optional().trim().isLength({ max: 1000 }),
   body('subject').isLength({ min: 1 }),
-  body('grade').isIn(['preprimary', 'grade1', 'grade2', 'grade3', 'grade4', 'grade5', 'grade6', 'grade7', 'grade8', 'grade9', 'grade10', 'grade11', 'grade12']),
+  body('grade').isIn([
+    'preprimary', 'grade1', 'grade2', 'grade3', 'grade4', 'grade5',
+    'grade6', 'grade7', 'grade8', 'grade9', 'grade10', 'grade11', 'grade12'
+  ]),
   body('year').isInt({ min: 2020, max: 2030 }),
   body('term').isIn(['1', '2', '3']),
-  body('resource_type').isIn(['lesson_plan', 'worksheet', 'assessment', 'marking_scheme', 'question_paper', 'teaching_aid', 'mocks', 'schemes', 'curriculum_design', 'notes', 'holiday_assignment']),
+  body('resource_type').isIn([
+    'lesson_plan', 'worksheet', 'assessment', 'marking_scheme', 'question_paper',
+    'teaching_aid', 'mocks', 'schemes', 'curriculum_design', 'notes', 'holiday_assignment'
+  ]),
   body('is_premium').isBoolean(),
   body('files').isArray({ min: 1 })
 ], async (req, res) => {
@@ -213,6 +247,7 @@ router.post('/', authenticateToken, requireRole(['staff', 'admin']), [
     }
 
     const {
+      school,
       title,
       description,
       subject,
@@ -224,30 +259,45 @@ router.post('/', authenticateToken, requireRole(['staff', 'admin']), [
       files
     } = req.body;
 
-    // Start transaction
     await db.query('BEGIN');
 
     try {
-      // Insert resource
+      // Calculate file statistics
+      const fileCount = files.length;
+      const totalFileSize = files.reduce((sum, file) => sum + (file.size || 0), 0);
+
+      // Insert into resources table
       const resourceResult = await db.query(`
         INSERT INTO resources (
-          title, description, subject, grade, year, term, 
-          resource_type, is_premium, uploaded_by
+          school, title, description, subject, grade, year, term, 
+          resource_type, is_premium, uploaded_by, file_count, total_file_size
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         RETURNING *
-      `, [title, description, subject, grade, year, term, resource_type, is_premium, req.user.id]);
+      `, [school, title, description, subject, grade, year, term, resource_type, is_premium, req.user.id, fileCount, totalFileSize]);
 
       const resource = resourceResult.rows[0];
 
-      // Insert files
-      for (const file of files) {
+      // Insert into resource_files table
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
         await db.query(`
           INSERT INTO resource_files (
-            resource_id, file_name, file_url, file_size, file_type
+            resource_id, file_name, file_url, file_size, file_type, 
+            mime_type, r2_key, r2_bucket, file_order
           )
-          VALUES ($1, $2, $3, $4, $5)
-        `, [resource.id, file.name, file.url, file.size, file.type]);
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        `, [
+          resource.id,
+          file.name,
+          file.url,
+          file.size,
+          file.type || 'main_file',
+          file.mime_type || 'application/pdf',
+          file.key,
+          'elimufiti-resources',
+          i + 1
+        ]);
       }
 
       await db.query('COMMIT');
@@ -255,12 +305,18 @@ router.post('/', authenticateToken, requireRole(['staff', 'admin']), [
       res.status(201).json({
         success: true,
         message: 'Resource created successfully',
-        data: resource
+        data: resource,
+        tables_filled: {
+          resources: 1,
+          resource_files: files.length
+        }
       });
+
     } catch (error) {
       await db.query('ROLLBACK');
       throw error;
     }
+
   } catch (error) {
     console.error('Create resource error:', error);
     res.status(500).json({
@@ -270,15 +326,16 @@ router.post('/', authenticateToken, requireRole(['staff', 'admin']), [
   }
 });
 
-// Download resource (track downloads)
+// ============================================
+// TRACK DOWNLOAD (FILLS 1 TABLE + UPDATES 1 TABLE)
+// ============================================
 router.post('/:id/download', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Get resource
     const resourceResult = await db.query(
-      'SELECT * FROM resources WHERE id = $1',
-      [id]
+      'SELECT * FROM resources WHERE id = $1 AND status = $2',
+      [id, 'active']
     );
 
     if (resourceResult.rows.length === 0) {
@@ -290,7 +347,6 @@ router.post('/:id/download', authenticateToken, async (req, res) => {
 
     const resource = resourceResult.rows[0];
 
-    // Check if user can download premium resources
     if (resource.is_premium && req.user.subscription_status !== 'active') {
       return res.status(403).json({
         success: false,
@@ -298,28 +354,151 @@ router.post('/:id/download', authenticateToken, async (req, res) => {
       });
     }
 
-    // Record download
-    await db.query(`
-      INSERT INTO downloads (user_id, resource_id)
-      VALUES ($1, $2)
-    `, [req.user.id, id]);
+    await db.query('BEGIN');
 
-    // Update download count
-    await db.query(`
-      UPDATE resources 
-      SET download_count = download_count + 1 
-      WHERE id = $1
-    `, [id]);
+    try {
+      await db.query(`
+        INSERT INTO downloads (user_id, resource_id, download_ip, user_agent)
+        VALUES ($1, $2, $3, $4)
+      `, [req.user.id, id, req.ip, req.get('User-Agent')]);
 
-    res.json({
-      success: true,
-      message: 'Download recorded successfully'
-    });
+      await db.query(`
+        UPDATE resources 
+        SET download_count = download_count + 1 
+        WHERE id = $1
+      `, [id]);
+
+      await db.query('COMMIT');
+
+      res.json({
+        success: true,
+        message: 'Download recorded successfully',
+        tables_affected: {
+          downloads: 'inserted 1 row',
+          resources: 'updated download_count'
+        }
+      });
+
+    } catch (error) {
+      await db.query('ROLLBACK');
+      throw error;
+    }
+
   } catch (error) {
     console.error('Download resource error:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to record download'
+    });
+  }
+});
+
+// ============================================
+// UPDATE RESOURCE (STAFF / ADMIN)
+// ============================================
+router.put('/:id', authenticateToken, requireRole(['staff', 'admin']), [
+  body('school').optional().trim().isLength({ min: 5, max: 500 }),
+  body('title').optional().trim().isLength({ min: 5, max: 500 }),
+  body('description').optional().trim().isLength({ max: 1000 }),
+  body('subject').optional().isLength({ min: 1 }),
+  body('is_premium').optional().isBoolean()
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation errors',
+        errors: errors.array()
+      });
+    }
+
+    const { id } = req.params;
+    const updates = req.body;
+
+    const updateFields = [];
+    const values = [];
+    let paramCount = 0;
+
+    Object.keys(updates).forEach(key => {
+      if (updates[key] !== undefined) {
+        paramCount++;
+        updateFields.push(`${key} = $${paramCount}`);
+        values.push(updates[key]);
+      }
+    });
+
+    if (updateFields.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No fields to update'
+      });
+    }
+
+    values.push(id);
+    const query = `
+      UPDATE resources 
+      SET ${updateFields.join(', ')}, updated_at = NOW()
+      WHERE id = $${paramCount + 1} AND status = 'active'
+      RETURNING *
+    `;
+
+    const result = await db.query(query, values);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Resource not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Resource updated successfully',
+      data: result.rows[0]
+    });
+
+  } catch (error) {
+    console.error('Update resource error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update resource'
+    });
+  }
+});
+
+// ============================================
+// DELETE RESOURCE (SOFT DELETE)
+// ============================================
+router.delete('/:id', authenticateToken, requireRole(['staff', 'admin']), async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await db.query(`
+      UPDATE resources 
+      SET status = 'inactive', updated_at = NOW()
+      WHERE id = $1 AND status = 'active'
+      RETURNING id, title
+    `, [id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Resource not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Resource deleted successfully',
+      data: result.rows[0]
+    });
+
+  } catch (error) {
+    console.error('Delete resource error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to delete resource'
     });
   }
 });

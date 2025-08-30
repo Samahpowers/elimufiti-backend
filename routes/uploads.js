@@ -2,6 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { authenticateToken, requireRole } = require('../middleware/auth');
+const db = require('../config/database');
 
 const router = express.Router();
 
@@ -29,7 +30,7 @@ const upload = multer({
       'application/vnd.openxmlformats-officedocument.presentationml.presentation'
     ];
     if (allowedTypes.includes(file.mimetype)) cb(null, true);
-    else cb(new Error('Invalid file type.'));
+    else cb(new Error('Invalid file type. Only PDF, DOC, DOCX, PPT, and PPTX files are allowed.'));
   }
 });
 
@@ -42,27 +43,43 @@ router.post(
   async (req, res) => {
     try {
       if (!req.files || req.files.length === 0) {
-        return res.status(400).json({ success: false, message: 'No files uploaded' });
+        return res.status(400).json({ 
+          success: false, 
+          message: 'No files uploaded' 
+        });
       }
 
       const uploadPromises = req.files.map(async (file) => {
-        const key = `resources/${Date.now()}-${file.originalname}`;
+        const timestamp = Date.now();
+        const sanitizedName = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
+        const key = `resources/${timestamp}-${sanitizedName}`;
 
+        // Upload to R2
         await r2.send(
           new PutObjectCommand({
             Bucket: process.env.R2_BUCKET_NAME,
             Key: key,
             Body: file.buffer,
-            ContentType: file.mimetype
+            ContentType: file.mimetype,
+            Metadata: {
+              'original-name': file.originalname,
+              'uploaded-by': req.user.id,
+              'upload-timestamp': timestamp.toString()
+            }
           })
         );
 
+        // Construct public URL
+       // const publicUrl = `${process.env.R2_PUBLIC_URL}/${key}`;
+
         return {
           name: file.originalname,
-          url: `${process.env.R2_ENDPOINT}/${process.env.R2_BUCKET_NAME}/${key}`,
+          //url: publicUrl,
           size: file.size,
           type: 'main_file',
-          key
+          key: key,
+          mime_type: file.mimetype,
+          r2_key: key
         };
       });
 
@@ -86,19 +103,30 @@ router.post(
 
 // Delete file from R2
 router.delete(
-  '/files/:key',
+  '/files/:key(*)',
   authenticateToken,
   requireRole(['staff', 'admin']),
   async (req, res) => {
     try {
       const { key } = req.params;
 
+      // Delete from R2
       await r2.send(
         new DeleteObjectCommand({
           Bucket: process.env.R2_BUCKET_NAME,
           Key: key
         })
       );
+
+      // Also remove from database if it exists
+      try {
+        await db.query(
+          'UPDATE resource_files SET is_active = false WHERE r2_key = $1',
+          [key]
+        );
+      } catch (dbError) {
+        console.warn('Could not update database record:', dbError.message);
+      }
 
       res.json({
         success: true,
@@ -110,6 +138,41 @@ router.delete(
         success: false,
         message: 'Failed to delete file',
         error: error.message
+      });
+    }
+  }
+);
+
+// Get file info (for verification)
+router.get(
+  '/files/:key(*)/info',
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const { key } = req.params;
+
+      // Check if file exists in database
+      const result = await db.query(
+        'SELECT * FROM resource_files WHERE r2_key = $1 AND is_active = true',
+        [key]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          success: false,
+          message: 'File not found'
+        });
+      }
+
+      res.json({
+        success: true,
+        data: result.rows[0]
+      });
+    } catch (error) {
+      console.error('Get file info error:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Failed to get file info'
       });
     }
   }
